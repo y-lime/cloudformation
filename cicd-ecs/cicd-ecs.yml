@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: 2010-09-09
+
+Description: CodePipeline for continuous integration and continuous deployment
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: Stack Configuration
+        Parameters:
+          - ProjectName
+          - BranchName
+          - RepositoryName
+          - EcrRepositoryName
+          - BuildDockerImage
+      - Label:
+          default: ECS Deploy Configuration (Only resident application)
+        Parameters:
+          - EcsClusterName
+          - EcsServiceName
+          - EcsContainerName
+          - EcsDeployTimeoutMinutes
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ""
+    Description: Name of the Project
+  BranchName:
+    Type: String
+    Default: "master"
+    Description: Name of the CodeCommit Branch
+  RepositoryName:
+    Type: String
+    Default: ""
+    Description: Name of the CodeCommit repository
+  EcrRepositoryName:
+    Type: String
+    Default: ""
+    Description: Name of the ECR repository
+  BuildDockerImage:
+    Type: String
+    Default: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+    Description: Docker image to use for the build phase
+  EcsClusterName:
+    Type: String
+    Default: ""
+    Description: (Optional) ECS Cluster Name
+  EcsServiceName:
+    Type: String
+    Default: ""
+    Description: (Optional) ECS Service Name
+  EcsContainerName:
+    Type: String
+    Default: ""
+    Description: (Optional) ECS Container Name
+  EcsDeployTimeoutMinutes:
+    Type: String
+    Description: "(Optional) ECS Deploy Timeout minutes (Max:60)"
+    Default: "15"
+
+Conditions:
+  CreateEcsDeploy: !And
+    - !Not
+      - !Equals
+        - !Ref EcsClusterName
+        - ""
+    - !Not
+      - !Equals
+        - !Ref EcsServiceName
+        - ""
+    - !Not
+      - !Equals
+        - !Ref EcsContainerName
+        - ""
+
+Resources:
+  PipelineS3Bucket:
+    Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BucketName:
+        Fn::Transform:
+          Name: "String"
+          Parameters:
+            InputString: !Sub "${AWS::StackName}-artifact"
+            Operation: Lower
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-codebuildrole"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Action: "sts:AssumeRole"
+            Principal:
+              Service: codebuild.amazonaws.com
+        Version: 2012-10-17
+      Policies:
+        - PolicyName: CanLog
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${ProjectName}*:log-stream:*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt PipelineS3Bucket.Arn
+                  - !Sub "${PipelineS3Bucket.Arn}/*"
+        - PolicyName: CanAccessS3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !GetAtt PipelineS3Bucket.Arn
+        - PolicyName: CanAccessECR
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:CompleteLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:InitiateLayerUpload
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                Resource:
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${EcrRepositoryName}"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource:
+                  - "*"
+        - PolicyName: CanAccessBuildReport
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:CreateReportGroup
+                  - codebuild:CreateReport
+                  - codebuild:UpdateReport
+                  - codebuild:BatchPutTestCases
+                  - codebuild:BatchPutCodeCoverages
+                Resource:
+                  - !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:report-group/${ProjectName}-*"
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${ProjectName}-${BranchName}-Build"
+      Artifacts:
+        Type: CODEPIPELINE
+        EncryptionDisabled: true
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: REPOSITORY_NAME
+            Value: !Ref EcrRepositoryName
+          - !If
+            - CreateEcsDeploy
+            - Name: CONTAINER_NAME
+              Value: !Ref EcsContainerName
+            - !Ref "AWS::NoValue"
+        Image: !Ref BuildDockerImage
+        Type: LINUX_CONTAINER
+      ServiceRole: !Ref CodeBuildRole
+      Source:
+        Type: CODEPIPELINE
+      Tags:
+        - Key: "ProjectName"
+          Value: !Ref ProjectName
+        - Key: "BranchName"
+          Value: !Ref BranchName
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-codepipelinerole"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [codepipeline.amazonaws.com]
+            Action: ["sts:AssumeRole"]
+      Policies:
+        - PolicyName: CanAccessCodeCommit
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                Resource:
+                  - !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}"
+                  - !Sub "arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}/*"
+        - PolicyName: CanAccessS3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:GetBucketVersioning
+                  - s3:PutObject
+                  - s3:GetBucketPolicy
+                  - s3:GetObjectAcl
+                  - s3:PutObjectAcl
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt PipelineS3Bucket.Arn
+                  - !Sub "${PipelineS3Bucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BuildProject.Arn
+        - PolicyName: CanDeployECS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    iam:PassedToService:
+                      - ecs-tasks.amazonaws.com
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${ProjectName}-${BranchName}"
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineS3Bucket
+      RestartExecutionOnUpdate: false
+      RoleArn: !GetAtt PipelineRole.Arn
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: Source
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+              OutputArtifacts:
+                - Name: Source
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: Source
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 2
+        - !If
+          - CreateEcsDeploy
+          - Name: Deploy
+            Actions:
+              - Name: DeployECS
+                InputArtifacts:
+                  - Name: BuildOutput
+                ActionTypeId:
+                  Category: Deploy
+                  Owner: AWS
+                  Version: "1"
+                  Provider: ECS
+                Configuration:
+                  ClusterName: !Ref EcsClusterName
+                  ServiceName: !Ref EcsServiceName
+                  DeploymentTimeout: !Ref EcsDeployTimeoutMinutes
+                RunOrder: 3
+          - !Ref "AWS::NoValue"
+      Tags:
+        - Key: "ProjectName"
+          Value: !Ref ProjectName
+        - Key: "BranchName"
+          Value: !Ref BranchName
+
+Outputs:
+  CodeBuildRoleArn:
+    Description: IAM Role ARN associated with CodeBuild projects
+    Value: !GetAtt CodeBuildRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}CodeBuildRoleArn"
+  CodeBuildRoleName:
+    Description: IAM Role name associated with CodeBuild projects
+    Value: !Ref CodeBuildRole
+    Export:
+      Name: !Sub "${AWS::StackName}CodeBuildRoleName"
